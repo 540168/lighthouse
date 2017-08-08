@@ -8,7 +8,6 @@
 import * as childProcess from 'child_process';
 import * as fs from 'fs';
 import * as chromeFinder from './chrome-finder';
-import {getRandomPort} from './random-port';
 import {DEFAULT_FLAGS} from './flags';
 import {makeTmpDir, defaults, delay} from './utils';
 import * as net from 'net';
@@ -38,6 +37,7 @@ export interface LaunchedChrome {
   pid: number;
   port: number;
   kill: () => Promise<{}>;
+  browserWs?: string;
 }
 
 export interface ModuleOverrides {
@@ -61,7 +61,12 @@ export async function launch(opts: Options = {}): Promise<LaunchedChrome> {
 
   await instance.launch();
 
-  return {pid: instance.pid!, port: instance.port!, kill: async () => instance.kill()};
+  return {
+    pid: instance.pid!,
+    port: instance.port!,
+    browserWs: instance.browserWs,
+    kill: async () => instance.kill()
+  };
 }
 
 export class Launcher {
@@ -69,8 +74,8 @@ export class Launcher {
   private pollInterval: number = 500;
   private pidFile: string;
   private startingUrl: string;
-  private outFile?: number;
-  private errFile?: number;
+  private outStream?: NodeJS.WritableStream;
+  private errStream?: NodeJS.WritableStream;
   private chromePath?: string;
   private enableExtensions?: boolean;
   private chromeFlags: string[];
@@ -83,6 +88,8 @@ export class Launcher {
   userDataDir?: string;
   port?: number;
   pid?: number;
+  browserWs?: string;
+
 
   constructor(private opts: Options = {}, moduleOverrides: ModuleOverrides = {}) {
     this.fs = moduleOverrides.fs || fs;
@@ -112,6 +119,7 @@ export class Launcher {
 
     if (process.platform === 'linux') {
       flags.push('--disable-setuid-sandbox');
+      flags.push('--no-sandbox');
     }
 
     flags.push(...this.chromeFlags);
@@ -132,8 +140,8 @@ export class Launcher {
     }
 
     this.userDataDir = this.opts.userDataDir || this.makeTmpDir();
-    this.outFile = this.fs.openSync(`${this.userDataDir}/chrome-out.log`, 'a');
-    this.errFile = this.fs.openSync(`${this.userDataDir}/chrome-err.log`, 'a');
+    this.outStream = this.fs.createWriteStream(`${this.userDataDir}/chrome-out.log`, {flags: 'a'});
+    this.errStream = this.fs.createWriteStream(`${this.userDataDir}/chrome-err.log`, {flags: 'a'});
 
     // fix for Node4
     // you can't pass a fd to fs.writeFileSync
@@ -182,24 +190,27 @@ export class Launcher {
         log.log('ChromeLauncher', `Chrome already running with pid ${this.chrome.pid}.`);
         return resolve(this.chrome.pid);
       }
-
-
-      // If a zero value port is set, it means the launcher
-      // is responsible for generating the port number.
-      // We do this here so that we can know the port before
-      // we pass it into chrome.
-      if (this.requestedPort === 0) {
-        this.port = await getRandomPort();
-      }
+      this.port = this.requestedPort;
 
       log.verbose(
           'ChromeLauncher', `Launching with command:\n"${execPath}" ${this.flags.join(' ')}`);
       const chrome = this.spawn(
-          execPath, this.flags, {detached: true, stdio: ['ignore', this.outFile, this.errFile]});
+          execPath, this.flags, {detached: true, stdio: ['ignore', 'pipe', 'pipe']});
+
+      chrome.stdout.setEncoding('utf8');
+      chrome.stderr.setEncoding('utf8');
+      chrome.stdout.pipe(this.outStream!);
+      chrome.stderr.pipe(this.errStream!);
+      const {port, targetURL} = await this.getActivePort(chrome.stderr);
+
+      if (targetURL.startsWith('ws://'))
+        this.browserWs = targetURL;
+      else
+        this.browserWs = null;
+
+      this.port = port;
       this.chrome = chrome;
-
       this.fs.writeFileSync(this.pidFile, chrome.pid.toString());
-
       log.verbose('ChromeLauncher', `Chrome running with pid ${chrome.pid} on port ${this.port}.`);
       resolve(chrome.pid);
     });
@@ -207,6 +218,24 @@ export class Launcher {
     const pid = await spawnPromise;
     await this.waitUntilReady();
     return pid;
+  }
+
+  private async getActivePort(stderr: NodeJS.ReadableStream): Promise<{port: number, targetURL: string}> {
+    let fulfill: Function;
+    let p: Promise<{port: number, targetURL: string}>|undefined;
+
+    p = new Promise(resolve => { fulfill = resolve;});
+    stderr.on('data', data => {
+      // As of https://chromium-review.googlesource.com/c/596719 Chrome will output the full browser WS target rather than simple port
+      // "DevTools listening on ws://127.0.0.1:63567/devtools/browser/2f168fe0-2d64-48aa-a22c-6ccaff6e9b24"
+      // "DevTools listening on 127.0.0.1:64223"
+      const match = data.match(/DevTools listening on ((?:ws:\/\/)?.*?:(\d+)\S+)/);
+      if (!match) return;
+      const port = parseInt(match[2]);
+      const targetURL = match[1];
+      return fulfill({port, targetURL});
+    });
+    return p;
   }
 
   private cleanup(client?: net.Socket) {
@@ -305,14 +334,14 @@ export class Launcher {
         return resolve();
       }
 
-      if (this.outFile) {
-        this.fs.closeSync(this.outFile);
-        delete this.outFile;
+      if (this.outStream) {
+        this.outStream.end();
+        delete this.outStream;
       }
 
-      if (this.errFile) {
-        this.fs.closeSync(this.errFile);
-        delete this.errFile;
+      if (this.errStream) {
+        this.errStream.end();
+        delete this.errStream;
       }
 
       this.rimraf(this.userDataDir, () => resolve());

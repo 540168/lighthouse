@@ -34,8 +34,10 @@ if (args.length) {
 }
 
 launch({
+  chromePath: '/users/paulirish/chromium/src/out/Standalone/Chromium.app/Contents/MacOS/Chromium',
   startingUrl,
   port,
   enableExtensions,
   chromeFlags,
-}).then(v => console.log(`✨  Chrome debugging port: ${v.port}`));
+}).then(v => {
+  console.log(`✨  Chrome debugging port: ${v.port}`); console.log(v); });
